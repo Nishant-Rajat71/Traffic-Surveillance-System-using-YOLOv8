@@ -175,9 +175,12 @@ def process_video(video_path, system, fps, progress_bar, status_text):
     out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
     
     frame_count = 0
-    total_detections = defaultdict(int)
+    # Track unique vehicles instead of total detections
+    unique_vehicles = set()  # Store unique vehicle IDs
+    vehicle_class_counts = defaultdict(set)  # Track unique vehicles per class
     all_speeds = []
     frame_stats = []
+    vehicle_speed_records = {}  # Store speed info per vehicle
     
     while cap.isOpened():
         ret, frame = cap.read()
@@ -207,18 +210,35 @@ def process_video(video_path, system, fps, progress_bar, status_text):
         # Track vehicles
         tracked_detections = system.track_vehicles(detections, frame_count)
         
+        # Frame-level counts (vehicles visible in current frame)
         frame_counts = defaultdict(int)
         frame_speeds = []
         
         for vehicle_id, box, label, confidence in tracked_detections:
             x1, y1, x2, y2 = box
             
+            # Count unique vehicles
+            unique_vehicles.add(vehicle_id)
+            vehicle_class_counts[label].add(vehicle_id)
+            
+            # Frame-level count
             frame_counts[label] += 1
-            total_detections[label] += 1
             
             # Calculate speed
             centroid = system.get_centroid(box)
             speed = system.calculate_speed(vehicle_id, centroid, frame_count, fps)
+            
+            # Track speed per vehicle
+            if speed is not None:
+                frame_speeds.append(speed)
+                all_speeds.append(speed)
+                if vehicle_id not in vehicle_speed_records:
+                    vehicle_speed_records[vehicle_id] = {
+                        'label': label,
+                        'speeds': [],
+                        'first_frame': frame_count
+                    }
+                vehicle_speed_records[vehicle_id]['speeds'].append(speed)
             
             # Draw bounding box
             color = get_class_color(label)
@@ -227,32 +247,39 @@ def process_video(video_path, system, fps, progress_bar, status_text):
             display_label = f'{label} {confidence:.2f}'
             if speed is not None:
                 display_label += f' | {speed:.1f} km/h'
-                frame_speeds.append(speed)
-                all_speeds.append(speed)
             
             cv2.putText(frame, display_label, (x1, y1-10),
                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
         
-        # Add overlay
+        # Add overlay with statistics
         overlay = frame.copy()
-        cv2.rectangle(overlay, (10, 10), (400, 150), (0, 0, 0), -1)
+        cv2.rectangle(overlay, (10, 10), (450, 180), (0, 0, 0), -1)
         cv2.addWeighted(overlay, 0.7, frame, 0.3, 0, frame)
         
-        cv2.putText(frame, f'Frame: {frame_count}', (20, 40),
+        cv2.putText(frame, f'Frame: {frame_count}/{total_frames}', (20, 40),
                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-        cv2.putText(frame, f'Total Vehicles: {sum(frame_counts.values())}', (20, 70),
+        cv2.putText(frame, f'Vehicles in Frame: {sum(frame_counts.values())}', (20, 70),
                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+        cv2.putText(frame, f'Total Unique Vehicles: {len(unique_vehicles)}', (20, 100),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (100, 255, 100), 2)
         
         if frame_speeds:
-            cv2.putText(frame, f'Avg Speed: {np.mean(frame_speeds):.1f} km/h', (20, 100),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (100, 255, 100), 2)
+            cv2.putText(frame, f'Avg Speed (frame): {np.mean(frame_speeds):.1f} km/h', (20, 130),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 200, 100), 2)
         
-        # Save stats
+        if all_speeds:
+            cv2.putText(frame, f'Overall Avg Speed: {np.mean(all_speeds):.1f} km/h', (20, 160),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 150, 150), 2)
+        
+        # Save frame statistics
         stats = dict(frame_counts)
         stats['frame_number'] = frame_count
-        stats['total_vehicles'] = sum(frame_counts.values())
+        stats['vehicles_in_frame'] = sum(frame_counts.values())
+        stats['unique_vehicles_total'] = len(unique_vehicles)
         if frame_speeds:
-            stats['avg_speed'] = np.mean(frame_speeds)
+            stats['avg_speed_frame'] = np.mean(frame_speeds)
+        if all_speeds:
+            stats['avg_speed_overall'] = np.mean(all_speeds)
         frame_stats.append(stats)
         
         out.write(frame)
@@ -262,12 +289,15 @@ def process_video(video_path, system, fps, progress_bar, status_text):
         if frame_count % 10 == 0:
             progress = frame_count / total_frames
             progress_bar.progress(progress)
-            status_text.text(f"Processing: {frame_count}/{total_frames} frames")
+            status_text.text(f"Processing: {frame_count}/{total_frames} frames | Unique Vehicles: {len(unique_vehicles)}")
     
     cap.release()
     out.release()
     
-    return output_path, total_detections, all_speeds, frame_stats
+    # Convert sets to counts for final results
+    total_detections = {k: len(v) for k, v in vehicle_class_counts.items()}
+    
+    return output_path, total_detections, all_speeds, frame_stats, vehicle_speed_records
 
 # Streamlit UI
 def main():
@@ -281,34 +311,48 @@ def main():
         model_choice = st.selectbox(
             "Select YOLO Model",
             ["yolov8n.pt", "yolov8s.pt", "yolov8m.pt", "yolov8l.pt", "yolov8x.pt"],
-            help="Larger models are more accurate but slower"
+            help="Larger models are more accurate but slower. Start with 'n' (nano) for fast results."
         )
         
+        st.markdown("**Model Comparison:**")
+        st.markdown("""
+        - **n (nano)**: Fastest, 37% accuracy
+        - **s (small)**: Fast, 45% accuracy
+        - **m (medium)**: Balanced, 50% accuracy
+        - **l (large)**: Slower, 53% accuracy
+        - **x (extra-large)**: Slowest, 54% accuracy
+        """)
+        
+        st.markdown("---")
+        
         meter_per_pixel = st.number_input(
-            "Calibration (meter/pixel)",
+            "🎯 Calibration (meter/pixel)",
             min_value=0.01,
             max_value=1.0,
             value=0.05,
             step=0.01,
-            help="Adjust based on camera setup for accurate speed"
+            help="How to calibrate: Measure a known distance in your video (e.g., lane width = 3.5m), count pixels (e.g., 70px), then: 3.5/70 = 0.05"
         )
         
         fps = st.number_input(
-            "Video FPS",
+            "🎬 Video FPS",
             min_value=1,
-            max_value=60,
+            max_value=120,
             value=30,
-            help="Frames per second of input video"
+            help="Set this to match your video's actual frame rate. Check video properties if unsure."
         )
         
         st.markdown("---")
         st.markdown("### 📊 About")
         st.info("""
-        This system uses YOLOv8 to:
-        - Detect vehicles in real-time
-        - Classify: car, truck, bus, motorcycle, bicycle
-        - Measure speed using centroid tracking
-        - Generate analytics and statistics
+        **This system:**
+        - ✅ Detects vehicles in real-time
+        - ✅ Classifies: car, truck, bus, motorcycle, bicycle
+        - ✅ Counts **unique vehicles** (not frame-by-frame)
+        - ✅ Measures speed using centroid tracking
+        - ✅ Generates analytics and statistics
+        
+        **Note:** First run downloads model weights (~6-136MB)
         """)
     
     # Main content
@@ -344,6 +388,9 @@ def main():
             st.write(f"**FPS:** {video_fps:.2f}")
             st.write(f"**Duration:** {duration:.2f}s")
             st.write(f"**Total Frames:** {total_frames}")
+            
+            if abs(video_fps - fps) > 2:
+                st.warning(f"⚠️ Your video FPS is {video_fps:.1f} but you set {fps}. Update the FPS setting for accurate speed!")
         
         # Process button
         if st.button("🚀 Start Analysis", type="primary"):
@@ -360,7 +407,7 @@ def main():
             
             # Process video
             with st.spinner("Processing video..."):
-                output_path, detections, speeds, frame_stats = process_video(
+                output_path, detections, speeds, frame_stats, vehicle_records = process_video(
                     video_path, system, fps, progress_bar, status_text
                 )
             
@@ -375,31 +422,41 @@ def main():
             col1, col2, col3, col4 = st.columns(4)
             
             with col1:
-                st.metric("Total Vehicles", sum(detections.values()))
+                total_vehicles = sum(detections.values())
+                st.metric("🚗 Total Unique Vehicles", total_vehicles)
             
             with col2:
                 if speeds:
-                    st.metric("Avg Speed", f"{np.mean(speeds):.1f} km/h")
+                    st.metric("⚡ Avg Speed", f"{np.mean(speeds):.1f} km/h")
                 else:
-                    st.metric("Avg Speed", "N/A")
+                    st.metric("⚡ Avg Speed", "N/A")
             
             with col3:
                 if speeds:
-                    st.metric("Max Speed", f"{np.max(speeds):.1f} km/h")
+                    st.metric("🚀 Max Speed", f"{np.max(speeds):.1f} km/h")
                 else:
-                    st.metric("Max Speed", "N/A")
+                    st.metric("🚀 Max Speed", "N/A")
             
             with col4:
-                st.metric("Unique Classes", len(detections))
+                st.metric("📋 Unique Classes", len(detections))
             
             # Vehicle breakdown
             st.markdown("### 🚗 Vehicle Distribution")
             if detections:
-                df_detections = pd.DataFrame([
-                    {"Vehicle Type": k.capitalize(), "Count": v}
-                    for k, v in detections.items()
-                ])
-                st.dataframe(df_detections, use_container_width=True)
+                col1, col2 = st.columns([2, 1])
+                
+                with col1:
+                    df_detections = pd.DataFrame([
+                        {"Vehicle Type": k.capitalize(), "Count": v}
+                        for k, v in sorted(detections.items(), key=lambda x: x[1], reverse=True)
+                    ])
+                    st.dataframe(df_detections, use_container_width=True, hide_index=True)
+                
+                with col2:
+                    st.markdown("**Breakdown:**")
+                    for vehicle, count in sorted(detections.items(), key=lambda x: x[1], reverse=True):
+                        percentage = (count / sum(detections.values())) * 100
+                        st.write(f"**{vehicle.capitalize()}:** {count} ({percentage:.1f}%)")
             
             # Speed statistics
             if speeds:
@@ -410,20 +467,24 @@ def main():
                     st.write(f"**Mean:** {np.mean(speeds):.2f} km/h")
                     st.write(f"**Median:** {np.median(speeds):.2f} km/h")
                     st.write(f"**Std Dev:** {np.std(speeds):.2f} km/h")
+                    st.write(f"**Min:** {np.min(speeds):.2f} km/h")
+                    st.write(f"**Max:** {np.max(speeds):.2f} km/h")
                 
                 with col2:
                     slow = sum(1 for s in speeds if s < 40)
                     medium = sum(1 for s in speeds if 40 <= s < 80)
                     fast = sum(1 for s in speeds if s >= 80)
+                    total_speed_measurements = len(speeds)
                     
-                    st.write(f"**Slow (<40 km/h):** {slow}")
-                    st.write(f"**Medium (40-80 km/h):** {medium}")
-                    st.write(f"**Fast (≥80 km/h):** {fast}")
+                    st.write(f"**Total Speed Measurements:** {total_speed_measurements}")
+                    st.write(f"**Slow (<40 km/h):** {slow} ({slow/total_speed_measurements*100:.1f}%)")
+                    st.write(f"**Medium (40-80 km/h):** {medium} ({medium/total_speed_measurements*100:.1f}%)")
+                    st.write(f"**Fast (≥80 km/h):** {fast} ({fast/total_speed_measurements*100:.1f}%)")
             
             # Download results
             st.markdown("### 📥 Download Results")
             
-            col1, col2 = st.columns(2)
+            col1, col2, col3 = st.columns(3)
             
             with col1:
                 with open(output_path, 'rb') as f:
@@ -439,20 +500,44 @@ def main():
                     df_stats = pd.DataFrame(frame_stats)
                     csv = df_stats.to_csv(index=False)
                     st.download_button(
-                        "⬇️ Download Statistics CSV",
+                        "⬇️ Download Frame Statistics",
                         csv,
-                        file_name="traffic_statistics.csv",
+                        file_name="frame_statistics.csv",
                         mime="text/csv"
                     )
             
+            with col3:
+                if vehicle_records:
+                    vehicle_data = []
+                    for vid, data in vehicle_records.items():
+                        if data['speeds']:
+                            vehicle_data.append({
+                                'vehicle_id': vid,
+                                'type': data['label'],
+                                'first_frame': data['first_frame'],
+                                'avg_speed_kmh': np.mean(data['speeds']),
+                                'max_speed_kmh': np.max(data['speeds']),
+                                'measurements': len(data['speeds'])
+                            })
+                    
+                    if vehicle_data:
+                        df_vehicles = pd.DataFrame(vehicle_data)
+                        csv_vehicles = df_vehicles.to_csv(index=False)
+                        st.download_button(
+                            "⬇️ Download Vehicle Speeds",
+                            csv_vehicles,
+                            file_name="individual_vehicle_speeds.csv",
+                            mime="text/csv"
+                        )
+            
             # Display processed video
-            st.markdown("### 🎬 Processed Video")
+            st.markdown("### 🎬 Processed Video with Detections")
             st.video(output_path)
             
             # Cleanup
             try:
                 os.unlink(video_path)
-                os.unlink(output_path)
+                # Don't delete output_path yet, user might want to download
             except:
                 pass
 
