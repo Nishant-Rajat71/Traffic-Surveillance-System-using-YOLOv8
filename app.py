@@ -1,40 +1,16 @@
-import streamlit as st
+import tempfile
+import time
+from collections import defaultdict, deque
+
 import cv2
 import numpy as np
-from collections import defaultdict, deque
+import pandas as pd
+import streamlit as st
 from ultralytics import YOLO
-import tempfile
-import os
 
-# ---------------------- PAGE CONFIG ---------------------- #
-st.set_page_config(
-    page_title="Traffic Surveillance with Speed Detection",
-    page_icon="🚦",
-    layout="wide",
-    initial_sidebar_state="expanded"
-)
 
-st.markdown("""
-<style>
-.main {
-    padding: 0rem 1rem;
-}
-.stButton>button {
-    width: 100%;
-    background-color: #FF4B4B;
-    color: white;
-}
-.stButton>button:hover {
-    background-color: #FF6B6B;
-    color: white;
-}
-h1 {
-    color: #FF4B4B;
-}
-</style>
-""", unsafe_allow_html=True)
+# ================== ORIGINAL BACKEND (LIGHTLY ADAPTED) ==================
 
-# ---------------------- CORE CLASS ---------------------- #
 class TrafficSurveillanceSystem:
     def __init__(self):
         self.vehicle_classes = ["car", "truck", "bus", "motorbike", "bicycle"]
@@ -46,12 +22,15 @@ class TrafficSurveillanceSystem:
             'frames': deque(maxlen=30),
             'speeds': []
         })
-        self.meter_per_pixel = 0.05       # you can tune in sidebar
-        self.min_detection_frames = 5      # min frames before ID is trusted
+        self.meter_per_pixel = 0.05
+        self.min_detection_frames = 5
+        self.video_stats = {}
+        self.frame_stats = []
 
-    @st.cache_resource
-    def load_model(_self, model_name="yolov8x.pt"):
-        return YOLO(model_name)
+    def load_model(self, model_name="yolov8x.pt"):
+        if self.model is None:
+            self.model = YOLO(model_name)
+        return self.model
 
     def set_calibration(self, meter_per_pixel):
         self.meter_per_pixel = meter_per_pixel
@@ -63,109 +42,153 @@ class TrafficSurveillanceSystem:
     def calculate_iou(self, box1, box2):
         x1_1, y1_1, x2_1, y2_1 = box1
         x1_2, y1_2, x2_2, y2_2 = box2
+
         xi1, yi1 = max(x1_1, x1_2), max(y1_1, y1_2)
         xi2, yi2 = min(x2_1, x2_2), min(y2_1, y2_2)
+
         inter_area = max(0, xi2 - xi1) * max(0, yi2 - yi1)
         box1_area = (x2_1 - x1_1) * (y2_1 - y1_1)
         box2_area = (x2_2 - x1_2) * (y2_2 - y1_2)
         union_area = box1_area + box2_area - inter_area
+
         return inter_area / union_area if union_area > 0 else 0
 
-    def calculate_distance(self, p1, p2):
-        return np.sqrt((p1[0]-p2[0])**2 + (p1[1]-p2[1])**2)
+    def calculate_distance(self, point1, point2):
+        return np.sqrt((point1[0] - point2[0])**2 + (point1[1] - point2[1])**2)
 
     def calculate_speed(self, vehicle_id, current_position, current_frame, fps):
-        s = self.speed_data[vehicle_id]
-        s['coordinates'].append(current_position)
-        s['frames'].append(current_frame)
-        if len(s['coordinates']) < max(2, int(fps/2)):
+        speed_info = self.speed_data[vehicle_id]
+        speed_info['coordinates'].append(current_position)
+        speed_info['frames'].append(current_frame)
+
+        if len(speed_info['coordinates']) < max(2, int(fps / 2)):
             return None
-        start_pos = s['coordinates'][0]
-        end_pos   = s['coordinates'][-1]
-        pixel_dist = np.sqrt((end_pos[0]-start_pos[0])**2 +
-                             (end_pos[1]-start_pos[1])**2)
-        dist_m = pixel_dist * self.meter_per_pixel
-        frame_diff = s['frames'][-1] - s['frames'][0]
-        t = frame_diff / fps
-        if t <= 0:
-            return None
-        speed_kmh = (dist_m / t) * 3.6
-        if 0 < speed_kmh < 200:
-            s['speeds'].append(speed_kmh)
-            return speed_kmh
+
+        start_pos = speed_info['coordinates'][0]
+        end_pos = speed_info['coordinates'][-1]
+
+        pixel_distance = np.sqrt(
+            (end_pos[0] - start_pos[0])**2 + (end_pos[1] - start_pos[1])**2
+        )
+        distance_meters = pixel_distance * self.meter_per_pixel
+
+        frame_diff = speed_info['frames'][-1] - speed_info['frames'][0]
+        time_seconds = frame_diff / fps
+
+        if time_seconds > 0:
+            speed_kmh = (distance_meters / time_seconds) * 3.6
+            if 0 < speed_kmh < 200:
+                speed_info['speeds'].append(speed_kmh)
+                return speed_kmh
         return None
 
     def track_vehicles(self, detections, frame_number):
         current_detections = []
-        for box, label, conf in detections:
+
+        for detection in detections:
+            box, label, confidence = detection
             centroid = self.get_centroid(box)
-            best_id, best_score = None, 0
-            for vid, data in list(self.tracked_vehicles.items()):
-                if frame_number - data['last_frame'] > 5:
-                    continue
-                iou = self.calculate_iou(box, data['last_box'])
-                cdist = self.calculate_distance(centroid, data['last_centroid'])
-                if data['label'] == label and (iou > 0.3 or cdist < 150):
-                    score = iou*0.7 + (1 - min(cdist/150, 1))*0.3
-                    if score > best_score:
-                        best_score, best_id = score, vid
-            if best_id is not None and best_score > 0.3:
-                self.tracked_vehicles[best_id]['last_box'] = box
-                self.tracked_vehicles[best_id]['last_centroid'] = centroid
-                self.tracked_vehicles[best_id]['last_frame'] = frame_number
-                self.tracked_vehicles[best_id]['detection_count'] += 1
-                self.tracked_vehicles[best_id]['confidence'].append(conf)
-                current_detections.append((best_id, box, label, conf))
+            best_match_id = None
+            best_match_score = 0
+
+            for vehicle_id, tracked_data in list(self.tracked_vehicles.items()):
+                if frame_number - tracked_data['last_frame'] <= 5:
+                    iou = self.calculate_iou(box, tracked_data['last_box'])
+                    centroid_dist = self.calculate_distance(
+                        centroid, tracked_data['last_centroid']
+                    )
+
+                    if tracked_data['label'] == label:
+                        if iou > 0.3 or centroid_dist < 150:
+                            score = iou * 0.7 + (1 - min(centroid_dist / 150, 1)) * 0.3
+                            if score > best_match_score:
+                                best_match_score = score
+                                best_match_id = vehicle_id
+
+            if best_match_id is not None and best_match_score > 0.3:
+                self.tracked_vehicles[best_match_id].update({
+                    'last_box': box,
+                    'last_centroid': centroid,
+                    'last_frame': frame_number,
+                    'detection_count': self.tracked_vehicles[best_match_id]['detection_count'] + 1
+                })
+                self.tracked_vehicles[best_match_id]['confidence'].append(confidence)
+                current_detections.append((best_match_id, box, label, confidence))
             else:
-                vid = self.next_vehicle_id
+                vehicle_id = self.next_vehicle_id
                 self.next_vehicle_id += 1
-                self.tracked_vehicles[vid] = {
+                self.tracked_vehicles[vehicle_id] = {
                     'label': label,
                     'last_box': box,
                     'last_centroid': centroid,
                     'last_frame': frame_number,
                     'first_frame': frame_number,
-                    'confidence': [conf],
+                    'confidence': [confidence],
                     'detection_count': 1
                 }
-                current_detections.append((vid, box, label, conf))
+                current_detections.append((vehicle_id, box, label, confidence))
 
-        # cleanup
-        stale = [vid for vid, d in self.tracked_vehicles.items()
-                 if frame_number - d['last_frame'] > 30]
-        for vid in stale:
+        stale_ids = [
+            vid for vid, data in self.tracked_vehicles.items()
+            if frame_number - data['last_frame'] > 30
+        ]
+        for vid in stale_ids:
             del self.tracked_vehicles[vid]
+
         return current_detections
 
     def get_valid_vehicles(self):
-        return {vid: d for vid, d in self.tracked_vehicles.items()
-                if d['detection_count'] >= self.min_detection_frames}
+        return {
+            vid: data for vid, data in self.tracked_vehicles.items()
+            if data['detection_count'] >= self.min_detection_frames
+        }
 
 
-def get_class_color(c):
+def get_class_color(class_name):
     colors = {
-        'car': (0,255,0),
-        'truck': (0,0,255),
-        'bus': (255,0,0),
-        'motorbike': (255,255,0),
-        'bicycle': (255,0,255)
+        'car': (0, 255, 0),
+        'truck': (0, 0, 255),
+        'bus': (255, 0, 0),
+        'motorbike': (255, 255, 0),
+        'bicycle': (255, 0, 255)
     }
-    return colors.get(c, (255,255,255))
+    return colors.get(class_name, (255, 255, 255))
 
-# ---------------------- PROCESSING ---------------------- #
-def process_video(video_path, system, fps, conf_threshold, progress_bar, status_text):
+
+def preprocess_video(video_path, system):
     cap = cv2.VideoCapture(video_path)
-    width  = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    video_stats = {
+        'width': int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)),
+        'height': int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)),
+        'fps': cap.get(cv2.CAP_PROP_FPS) or 30.0,
+        'total_frames': int(cap.get(cv2.CAP_PROP_FRAME_COUNT)),
+    }
+    video_stats['duration'] = (
+        video_stats['total_frames'] / video_stats['fps']
+        if video_stats['fps'] > 0 else 0
+    )
+    cap.release()
+    system.video_stats = video_stats
+    return video_stats
 
-    out_path = tempfile.NamedTemporaryFile(delete=False, suffix='.mp4').name
+
+def process_video_with_analysis(video_path, system, fps, conf_threshold):
+    cap = cv2.VideoCapture(video_path)
+    width = system.video_stats['width']
+    height = system.video_stats['height']
+    total_frames = system.video_stats['total_frames']
+
+    # temp file for processed video
+    temp_out = tempfile.NamedTemporaryFile(
+        suffix=".mp4", delete=False
+    )
+    output_path = temp_out.name
+    temp_out.close()
+
     fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-    out = cv2.VideoWriter(out_path, fourcc, fps, (width, height))
+    out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
 
     frame_count = 0
-    all_speeds = []
-    frame_stats = []
 
     while cap.isOpened():
         ret, frame = cap.read()
@@ -173,165 +196,146 @@ def process_video(video_path, system, fps, conf_threshold, progress_bar, status_
             break
 
         results = system.model(frame, conf=conf_threshold, iou=0.45, verbose=False)[0]
+
         detections = []
         if results.boxes is not None:
             for box in results.boxes:
                 cls_id = int(box.cls[0])
-                label  = system.model.names[cls_id]
-                conf   = float(box.conf[0])
+                label = system.model.names[cls_id]
+                confidence = float(box.conf[0])
+
                 if label in system.vehicle_classes:
                     x1, y1, x2, y2 = map(int, box.xyxy[0])
-                    detections.append(([x1, y1, x2, y2], label, conf))
+                    detections.append(([x1, y1, x2, y2], label, confidence))
 
-        tracked = system.track_vehicles(detections, frame_count)
-        valid   = system.get_valid_vehicles()
+        tracked_detections = system.track_vehicles(detections, frame_count)
+        valid_vehicles = system.get_valid_vehicles()
 
         frame_counts = defaultdict(int)
         frame_speeds = []
 
-        for vid, box, label, conf in tracked:
+        for vehicle_id, box, label, confidence in tracked_detections:
             x1, y1, x2, y2 = box
             frame_counts[label] += 1
+
             centroid = system.get_centroid(box)
-            speed = system.calculate_speed(vid, centroid, frame_count, fps)
+            speed = system.calculate_speed(vehicle_id, centroid, frame_count, fps)
+
             if speed is not None:
                 frame_speeds.append(speed)
-                all_speeds.append(speed)
 
-            color = get_class_color(label) if vid in valid else (128,128,128)
-            cv2.rectangle(frame, (x1,y1), (x2,y2), color, 2)
-            txt = f"{label} {conf:.2f}"
+            color = get_class_color(label) if vehicle_id in valid_vehicles else (128, 128, 128)
+            cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+
+            display_label = f'{label} {confidence:.2f}'
             if speed is not None:
-                txt += f" | {speed:.1f} km/h"
-            cv2.putText(frame, txt, (x1, y1-10),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+                display_label += f' | {speed:.1f} km/h'
+            cv2.putText(
+                frame, display_label, (x1, y1 - 10),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2
+            )
 
-        # overlay (same logic as Colab, but without total unique/overall avg)
+        # overlay similar to Colab version
         overlay = frame.copy()
-        cv2.rectangle(overlay, (10,10), (450,130), (0,0,0), -1)
+        cv2.rectangle(overlay, (10, 10), (450, 130), (0, 0, 0), -1)
         cv2.addWeighted(overlay, 0.7, frame, 0.3, 0, frame)
 
-        cv2.putText(frame, 'Traffic Analysis with Speed Detection', (20,35),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255,255,255), 2)
-        cv2.putText(frame, f'Frame: {frame_count}/{total_frames}', (20,65),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255,255,255), 1)
-        cv2.putText(frame, f'Vehicles in Frame: {sum(frame_counts.values())}', (20,95),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,255,255), 2)
-        if frame_speeds:
-            cv2.putText(frame, f'Avg Speed: {np.mean(frame_speeds):.1f} km/h', (20,125),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,200,100), 2)
+        cv2.putText(
+            frame, 'Traffic Analysis with Speed Detection', (20, 35),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2
+        )
+        cv2.putText(
+            frame, f'Frame: {frame_count}/{total_frames}', (20, 65),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1
+        )
+        cv2.putText(
+            frame, f'Vehicles in Frame: {sum(frame_counts.values())}', (20, 95),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 2
+        )
 
-        stats = dict(frame_counts)
-        stats['frame_number']      = frame_count
-        stats['vehicles_in_frame'] = sum(frame_counts.values())
         if frame_speeds:
-            stats['avg_speed'] = float(np.mean(frame_speeds))
-        frame_stats.append(stats)
+            cv2.putText(
+                frame, f'Avg Speed: {np.mean(frame_speeds):.1f} km/h', (20, 125),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 200, 100), 2
+            )
 
         out.write(frame)
         frame_count += 1
 
-        if frame_count % 10 == 0:
-            progress_bar.progress(frame_count/total_frames)
-            status_text.text(
-                f"Processing {frame_count}/{total_frames} frames"
-            )
-
     cap.release()
     out.release()
-    return out_path, frame_stats, all_speeds
+    return output_path
 
-# ---------------------- STREAMLIT UI ---------------------- #
-def main():
-    st.title("🚦 Traffic Surveillance & Speed Measurement System")
-    st.markdown("Real-time vehicle detection, counting, and speed estimation (YOLOv8).")
 
-    with st.sidebar:
-        st.header("⚙️ Configuration")
-        model_choice = st.selectbox(
-            "YOLOv8 Model",
-            ["yolov8n.pt", "yolov8s.pt", "yolov8m.pt", "yolov8l.pt", "yolov8x.pt"],
-            index=4  # default x
-        )
-        conf_th = st.slider("Confidence Threshold", 0.1, 0.9, 0.4, 0.05)
-        meter_per_pixel = st.number_input(
-            "Calibration (meter/pixel)", 0.01, 1.0, 0.05, 0.01,
-            help="Real-world meters represented by one pixel."
-        )
-        fps = st.number_input(
-            "Output Video FPS", 1, 120, 30,
-            help="Set equal to source FPS for correct speed."
-        )
+# ================== STREAMLIT FRONTEND ==================
 
-    uploaded = st.file_uploader(
-        "Upload traffic video (mp4, avi, mov, mkv)", 
-        type=["mp4", "avi", "mov", "mkv"]
+st.set_page_config(page_title="Traffic Surveillance with YOLOv8", layout="wide")
+
+st.title("Traffic Surveillance System – YOLOv8")
+
+left_col, right_col = st.columns([3, 1])
+
+with right_col:
+    st.subheader("About this project")
+    st.markdown(
+        """
+This app performs automatic traffic analysis from CCTV videos using the YOLOv8 object detection model.
+It detects and tracks vehicles frame‑by‑frame, estimates their speed, and overlays metrics like vehicle count and average speed directly on the processed video.
+Upload any road‑side video clip to quickly visualize traffic behaviour for research, monitoring, or signal‑timing studies.
+        """
     )
 
-    if uploaded is not None:
-        tmp_in = tempfile.NamedTemporaryFile(delete=False, suffix='.mp4')
-        tmp_in.write(uploaded.read())
-        video_path = tmp_in.name
+with left_col:
+    uploaded_file = st.file_uploader(
+        "Upload a traffic video", type=["mp4", "avi", "mov", "mkv"]
+    )
 
-        col1, col2 = st.columns([2,1])
-        with col1:
-            st.subheader("Original Video")
-            st.video(video_path)
-        with col2:
-            cap = cv2.VideoCapture(video_path)
-            v_fps = cap.get(cv2.CAP_PROP_FPS)
-            frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-            dur = frames / v_fps if v_fps > 0 else 0
-            w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-            h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-            cap.release()
-            st.subheader("Video Info")
-            st.write(f"Resolution: **{w}x{h}**")
-            st.write(f"FPS: **{v_fps:.2f}**")
-            st.write(f"Frames: **{frames}**")
-            st.write(f"Duration: **{dur:.2f} s**")
+    if uploaded_file is not None:
+        with st.spinner("Saving uploaded video..."):
+            # save upload to a temp file
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as tmp:
+                tmp.write(uploaded_file.read())
+                temp_input_path = tmp.name
 
-        if st.button("🚀 Start Processing", type="primary"):
-            with st.spinner("Loading YOLOv8 model..."):
-                system = TrafficSurveillanceSystem()
-                system.model = system.load_model(model_choice)
-                system.set_calibration(meter_per_pixel)
+        st.success("Video uploaded. Starting processing...")
 
-            progress_bar = st.progress(0.0)
-            status_text = st.empty()
+        # sidebar controls
+        st.sidebar.header("Settings")
+        model_name = st.sidebar.selectbox(
+            "YOLOv8 model", ["yolov8n.pt", "yolov8s.pt", "yolov8m.pt", "yolov8l.pt", "yolov8x.pt"],
+            index=4
+        )
+        conf_th = st.sidebar.slider(
+            "Confidence threshold", 0.1, 0.9, 0.4, 0.05
+        )
+        meter_per_pixel = st.sidebar.number_input(
+            "Meters per pixel (calibration)", min_value=0.001, max_value=1.0,
+            value=0.05, step=0.005, format="%.3f"
+        )
 
-            with st.spinner("Processing video..."):
-                out_path, frame_stats, speeds = process_video(
-                    video_path, system, fps, conf_th,
-                    progress_bar, status_text
-                )
+        # main processing
+        system = TrafficSurveillanceSystem()
+        system.load_model(model_name)
+        system.set_calibration(meter_per_pixel)
 
-            st.success("Processing complete!")
+        stats = preprocess_video(temp_input_path, system)
+        fps = stats["fps"] if stats["fps"] > 0 else 30.0
 
-            st.subheader("Processed Video")
-            st.video(out_path)
-
-            st.download_button(
-                "⬇️ Download Processed Video",
-                data=open(out_path, "rb").read(),
-                file_name=f"processed_{uploaded.name}",
-                mime="video/mp4"
+        start_time = time.time()
+        with st.spinner("Processing video with YOLOv8..."):
+            processed_path = process_video_with_analysis(
+                temp_input_path, system, fps, conf_th
             )
+        end_time = time.time()
 
-            # quick summary (similar to Colab prints)
-            st.subheader("Quick Summary")
-            if frame_stats:
-                df = pd.DataFrame(frame_stats)
-                st.write(f"Total frames: **{len(df)}**")
-                st.write(f"Average vehicles per frame: **{df['vehicles_in_frame'].mean():.2f}**")
-            if speeds:
-                st.write(f"Average speed: **{np.mean(speeds):.2f} km/h**")
-                st.write(f"Max speed: **{np.max(speeds):.2f} km/h**")
+        st.success(
+            f"Processing complete in {end_time - start_time:.1f} seconds. "
+            f"Duration: {stats['duration']:.1f} s, FPS used: {fps:.1f}"
+        )
 
-            try:
-                os.unlink(video_path)
-            except:
-                pass
-
-if __name__ == "__main__":
-    main()
+        # show only processed video
+        with open(processed_path, "rb") as f:
+            video_bytes = f.read()
+        st.video(video_bytes)
+    else:
+        st.info("Please upload a traffic video to begin analysis.")
