@@ -1,8 +1,5 @@
-streamlit==1.32.2
-ultralytics==8.2.0
-opencv-python-headless==4.9.0.80
-numpy==1.26.4
-pandas==2.2.2
-torch           # let Streamlit Cloud / local env pick a compatible version
-torchvision
-Pillow
+streamlit>=1.28.0
+ultralytics>=8.0.0
+opencv-python-headless
+numpy
+pandas
