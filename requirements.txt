@@ -1,8 +1,10 @@
-opencv-python-headless==4.9.0.80
-ultralytics
+streamlit>=1.28.0
+ultralytics>=8.0.0
+opencv-python-headless
+numpy
+pandas
 matplotlib
 seaborn
-pandas
-numpy
 scikit-learn
-streamlit
+supervision
+pillow
