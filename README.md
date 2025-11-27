@@ -33,3 +33,5 @@ This project implements a high-accuracy traffic surveillance system using deep l
 ☁️ Google Colab / Kaggle — cloud runtime with GPU
 
 🗂️ CSV and TXT export — for analytic results
+
+Here is the link to access the application: https://7b5961b915be495d47.gradio.live/
