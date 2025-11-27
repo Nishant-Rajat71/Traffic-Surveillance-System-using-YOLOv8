@@ -40,12 +40,10 @@ class TrafficSurveillanceSystem:
             'frames': deque(maxlen=30)
         })
         self.meter_per_pixel = 0.05
-        # Track minimum frames before counting as valid vehicle
-        self.min_detection_frames = 5
         
     @st.cache_resource
     def load_model(_self, model_name="yolov8n.pt"):
-        """Load YOLOv8 model"""
+        """Load YOLOv8 model (using nano for faster inference in web app)"""
         return YOLO(model_name)
     
     def set_calibration(self, meter_per_pixel):
@@ -77,10 +75,6 @@ class TrafficSurveillanceSystem:
         union_area = box1_area + box2_area - inter_area
         
         return inter_area / union_area if union_area > 0 else 0
-    
-    def calculate_distance(self, point1, point2):
-        """Calculate Euclidean distance between two points"""
-        return np.sqrt((point1[0] - point2[0])**2 + (point1[1] - point2[1])**2)
     
     def calculate_speed(self, vehicle_id, current_position, current_frame, fps):
         """Calculate vehicle speed based on position history"""
@@ -116,82 +110,45 @@ class TrafficSurveillanceSystem:
         return None
     
     def track_vehicles(self, detections, frame_number):
-        """Enhanced tracking with stricter matching"""
+        """Track vehicles across frames"""
         current_detections = []
         
         for detection in detections:
             box, label, confidence = detection
-            centroid = self.get_centroid(box)
             matched = False
-            best_match_id = None
-            best_match_score = 0
             
-            # Try to match with existing tracks
             for vehicle_id, tracked_data in list(self.tracked_vehicles.items()):
                 last_box = tracked_data['last_box']
-                last_centroid = tracked_data['last_centroid']
                 last_frame = tracked_data['last_frame']
                 
-                # Only match if not too many frames have passed
-                if frame_number - last_frame <= 5:  # Increased tolerance
-                    # Calculate IoU
+                if frame_number - last_frame <= 3:
                     iou = self.calculate_iou(box, last_box)
-                    
-                    # Calculate centroid distance
-                    centroid_dist = self.calculate_distance(centroid, last_centroid)
-                    max_movement = 150  # Maximum pixels a vehicle can move between frames
-                    
-                    # Match if same class, good IoU OR close centroid distance
-                    if tracked_data['label'] == label:
-                        if iou > 0.3 or centroid_dist < max_movement:
-                            # Combined score (IoU weighted more)
-                            score = iou * 0.7 + (1 - min(centroid_dist / max_movement, 1)) * 0.3
-                            
-                            if score > best_match_score:
-                                best_match_score = score
-                                best_match_id = vehicle_id
+                    if iou > 0.4 and tracked_data['label'] == label:
+                        self.tracked_vehicles[vehicle_id]['last_box'] = box
+                        self.tracked_vehicles[vehicle_id]['last_frame'] = frame_number
+                        self.tracked_vehicles[vehicle_id]['confidence'].append(confidence)
+                        matched = True
+                        current_detections.append((vehicle_id, box, label, confidence))
+                        break
             
-            # If good match found, update existing track
-            if best_match_id is not None and best_match_score > 0.3:
-                self.tracked_vehicles[best_match_id]['last_box'] = box
-                self.tracked_vehicles[best_match_id]['last_centroid'] = centroid
-                self.tracked_vehicles[best_match_id]['last_frame'] = frame_number
-                self.tracked_vehicles[best_match_id]['confidence'].append(confidence)
-                self.tracked_vehicles[best_match_id]['detection_count'] += 1
-                current_detections.append((best_match_id, box, label, confidence))
-                matched = True
-            
-            # Create new track if no match
             if not matched:
                 vehicle_id = self.next_vehicle_id
                 self.next_vehicle_id += 1
                 self.tracked_vehicles[vehicle_id] = {
                     'label': label,
                     'last_box': box,
-                    'last_centroid': centroid,
                     'last_frame': frame_number,
                     'first_frame': frame_number,
-                    'confidence': [confidence],
-                    'detection_count': 1  # Track how many times detected
+                    'confidence': [confidence]
                 }
                 current_detections.append((vehicle_id, box, label, confidence))
         
-        # Clean up stale tracks
         stale_ids = [vid for vid, data in self.tracked_vehicles.items() 
                     if frame_number - data['last_frame'] > 30]
         for vid in stale_ids:
             del self.tracked_vehicles[vid]
         
         return current_detections
-    
-    def get_valid_vehicles(self):
-        """Get only vehicles that were detected enough times (reduces false positives)"""
-        valid_vehicles = {}
-        for vid, data in self.tracked_vehicles.items():
-            # Only count if detected at least min_detection_frames times
-            if data['detection_count'] >= self.min_detection_frames:
-                valid_vehicles[vid] = data
-        return valid_vehicles
 
 def get_class_color(class_name):
     """Get consistent color for each vehicle class"""
@@ -204,8 +161,8 @@ def get_class_color(class_name):
     }
     return colors.get(class_name, (255, 255, 255))
 
-def process_video(video_path, system, fps, conf_threshold, progress_bar, status_text):
-    """Process video with improved tracking"""
+def process_video(video_path, system, fps, progress_bar, status_text):
+    """Process video and return results"""
     cap = cv2.VideoCapture(video_path)
     
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
@@ -218,19 +175,22 @@ def process_video(video_path, system, fps, conf_threshold, progress_bar, status_
     out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
     
     frame_count = 0
+    # Track unique vehicles instead of total detections
+    unique_vehicles = set()  # Store unique vehicle IDs
+    vehicle_class_counts = defaultdict(set)  # Track unique vehicles per class
     all_speeds = []
     frame_stats = []
-    vehicle_speed_records = {}
+    vehicle_speed_records = {}  # Store speed info per vehicle
     
     while cap.isOpened():
         ret, frame = cap.read()
         if not ret:
             break
         
-        # Run detection with configurable confidence
+        # Run detection
         results = system.model(
             frame,
-            conf=conf_threshold,  # User-configurable
+            conf=0.25,
             iou=0.45,
             verbose=False
         )[0]
@@ -250,19 +210,16 @@ def process_video(video_path, system, fps, conf_threshold, progress_bar, status_
         # Track vehicles
         tracked_detections = system.track_vehicles(detections, frame_count)
         
-        # Get valid vehicles (detected enough times)
-        valid_vehicles = system.get_valid_vehicles()
-        unique_vehicles = set(valid_vehicles.keys())
-        vehicle_class_counts = defaultdict(set)
-        for vid, data in valid_vehicles.items():
-            vehicle_class_counts[data['label']].add(vid)
-        
-        # Frame-level counts
+        # Frame-level counts (vehicles visible in current frame)
         frame_counts = defaultdict(int)
         frame_speeds = []
         
         for vehicle_id, box, label, confidence in tracked_detections:
             x1, y1, x2, y2 = box
+            
+            # Count unique vehicles
+            unique_vehicles.add(vehicle_id)
+            vehicle_class_counts[label].add(vehicle_id)
             
             # Frame-level count
             frame_counts[label] += 1
@@ -283,53 +240,42 @@ def process_video(video_path, system, fps, conf_threshold, progress_bar, status_
                     }
                 vehicle_speed_records[vehicle_id]['speeds'].append(speed)
             
-            # Draw bounding box (color based on validity)
-            if vehicle_id in valid_vehicles:
-                color = get_class_color(label)
-            else:
-                color = (128, 128, 128)  # Gray for unconfirmed vehicles
-            
+            # Draw bounding box
+            color = get_class_color(label)
             cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
             
             display_label = f'{label} {confidence:.2f}'
             if speed is not None:
                 display_label += f' | {speed:.1f} km/h'
             
-            # Show detection count for debugging
-            detection_count = system.tracked_vehicles[vehicle_id]['detection_count']
-            if detection_count < system.min_detection_frames:
-                display_label += f' ({detection_count}/{system.min_detection_frames})'
-            
             cv2.putText(frame, display_label, (x1, y1-10),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 2)
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
         
         # Add overlay with statistics
         overlay = frame.copy()
-        cv2.rectangle(overlay, (10, 10), (450, 200), (0, 0, 0), -1)
+        cv2.rectangle(overlay, (10, 10), (450, 180), (0, 0, 0), -1)
         cv2.addWeighted(overlay, 0.7, frame, 0.3, 0, frame)
         
         cv2.putText(frame, f'Frame: {frame_count}/{total_frames}', (20, 40),
                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-        cv2.putText(frame, f'Detections in Frame: {sum(frame_counts.values())}', (20, 70),
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 2)
-        cv2.putText(frame, f'Valid Unique Vehicles: {len(unique_vehicles)}', (20, 100),
+        cv2.putText(frame, f'Vehicles in Frame: {sum(frame_counts.values())}', (20, 70),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+        cv2.putText(frame, f'Total Unique Vehicles: {len(unique_vehicles)}', (20, 100),
                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (100, 255, 100), 2)
-        cv2.putText(frame, f'(Min {system.min_detection_frames} detections required)', (20, 125),
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.4, (150, 150, 150), 1)
         
         if frame_speeds:
-            cv2.putText(frame, f'Avg Speed (frame): {np.mean(frame_speeds):.1f} km/h', (20, 155),
+            cv2.putText(frame, f'Avg Speed (frame): {np.mean(frame_speeds):.1f} km/h', (20, 130),
                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 200, 100), 2)
         
         if all_speeds:
-            cv2.putText(frame, f'Overall Avg Speed: {np.mean(all_speeds):.1f} km/h', (20, 185),
+            cv2.putText(frame, f'Overall Avg Speed: {np.mean(all_speeds):.1f} km/h', (20, 160),
                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 150, 150), 2)
         
         # Save frame statistics
         stats = dict(frame_counts)
         stats['frame_number'] = frame_count
-        stats['detections_in_frame'] = sum(frame_counts.values())
-        stats['valid_unique_vehicles'] = len(unique_vehicles)
+        stats['vehicles_in_frame'] = sum(frame_counts.values())
+        stats['unique_vehicles_total'] = len(unique_vehicles)
         if frame_speeds:
             stats['avg_speed_frame'] = np.mean(frame_speeds)
         if all_speeds:
@@ -343,12 +289,12 @@ def process_video(video_path, system, fps, conf_threshold, progress_bar, status_
         if frame_count % 10 == 0:
             progress = frame_count / total_frames
             progress_bar.progress(progress)
-            status_text.text(f"Processing: {frame_count}/{total_frames} frames | Valid Vehicles: {len(unique_vehicles)}")
+            status_text.text(f"Processing: {frame_count}/{total_frames} frames | Unique Vehicles: {len(unique_vehicles)}")
     
     cap.release()
     out.release()
     
-    # Final counts (only valid vehicles)
+    # Convert sets to counts for final results
     total_detections = {k: len(v) for k, v in vehicle_class_counts.items()}
     
     return output_path, total_detections, all_speeds, frame_stats, vehicle_speed_records
@@ -379,22 +325,13 @@ def main():
         
         st.markdown("---")
         
-        conf_threshold = st.slider(
-            "🎯 Confidence Threshold",
-            min_value=0.1,
-            max_value=0.9,
-            value=0.4,
-            step=0.05,
-            help="Higher = fewer false positives but might miss some vehicles. Lower = detect more but with false positives."
-        )
-        
         meter_per_pixel = st.number_input(
-            "📏 Calibration (meter/pixel)",
+            "🎯 Calibration (meter/pixel)",
             min_value=0.01,
             max_value=1.0,
             value=0.05,
             step=0.01,
-            help="Measure a known distance in video (e.g., lane = 3.5m), count pixels, divide: 3.5/70 = 0.05"
+            help="How to calibrate: Measure a known distance in your video (e.g., lane width = 3.5m), count pixels (e.g., 70px), then: 3.5/70 = 0.05"
         )
         
         fps = st.number_input(
@@ -402,20 +339,20 @@ def main():
             min_value=1,
             max_value=120,
             value=30,
-            help="Match your video's actual frame rate"
+            help="Set this to match your video's actual frame rate. Check video properties if unsure."
         )
         
         st.markdown("---")
         st.markdown("### 📊 About")
         st.info("""
         **This system:**
-        - ✅ Detects vehicles with adjustable confidence
-        - ✅ Requires 5+ detections to count as valid vehicle
+        - ✅ Detects vehicles in real-time
         - ✅ Classifies: car, truck, bus, motorcycle, bicycle
+        - ✅ Counts **unique vehicles** (not frame-by-frame)
         - ✅ Measures speed using centroid tracking
-        - ✅ Reduces false positives with enhanced tracking
+        - ✅ Generates analytics and statistics
         
-        **Tip:** If count is too high, increase confidence threshold to 0.5-0.6
+        **Note:** First run downloads model weights (~6-136MB)
         """)
     
     # Main content
@@ -453,7 +390,7 @@ def main():
             st.write(f"**Total Frames:** {total_frames}")
             
             if abs(video_fps - fps) > 2:
-                st.warning(f"⚠️ Video FPS is {video_fps:.1f} but you set {fps}. Update for accurate speed!")
+                st.warning(f"⚠️ Your video FPS is {video_fps:.1f} but you set {fps}. Update the FPS setting for accurate speed!")
         
         # Process button
         if st.button("🚀 Start Analysis", type="primary"):
@@ -471,7 +408,7 @@ def main():
             # Process video
             with st.spinner("Processing video..."):
                 output_path, detections, speeds, frame_stats, vehicle_records = process_video(
-                    video_path, system, fps, conf_threshold, progress_bar, status_text
+                    video_path, system, fps, progress_bar, status_text
                 )
             
             progress_bar.progress(1.0)
@@ -486,7 +423,7 @@ def main():
             
             with col1:
                 total_vehicles = sum(detections.values())
-                st.metric("🚗 Valid Unique Vehicles", total_vehicles)
+                st.metric("🚗 Total Unique Vehicles", total_vehicles)
             
             with col2:
                 if speeds:
@@ -501,9 +438,7 @@ def main():
                     st.metric("🚀 Max Speed", "N/A")
             
             with col4:
-                st.metric("📋 Vehicle Types", len(detections))
-            
-            st.info(f"ℹ️ **Note:** Only vehicles detected in {system.min_detection_frames}+ frames are counted to reduce false positives.")
+                st.metric("📋 Unique Classes", len(detections))
             
             # Vehicle breakdown
             st.markdown("### 🚗 Vehicle Distribution")
@@ -519,12 +454,9 @@ def main():
                 
                 with col2:
                     st.markdown("**Breakdown:**")
-                    total = sum(detections.values())
                     for vehicle, count in sorted(detections.items(), key=lambda x: x[1], reverse=True):
-                        percentage = (count / total) * 100 if total > 0 else 0
+                        percentage = (count / sum(detections.values())) * 100
                         st.write(f"**{vehicle.capitalize()}:** {count} ({percentage:.1f}%)")
-            else:
-                st.warning("No valid vehicles detected. Try lowering the confidence threshold.")
             
             # Speed statistics
             if speeds:
@@ -544,7 +476,7 @@ def main():
                     fast = sum(1 for s in speeds if s >= 80)
                     total_speed_measurements = len(speeds)
                     
-                    st.write(f"**Total Measurements:** {total_speed_measurements}")
+                    st.write(f"**Total Speed Measurements:** {total_speed_measurements}")
                     st.write(f"**Slow (<40 km/h):** {slow} ({slow/total_speed_measurements*100:.1f}%)")
                     st.write(f"**Medium (40-80 km/h):** {medium} ({medium/total_speed_measurements*100:.1f}%)")
                     st.write(f"**Fast (≥80 km/h):** {fast} ({fast/total_speed_measurements*100:.1f}%)")
@@ -599,13 +531,13 @@ def main():
                         )
             
             # Display processed video
-            st.markdown("### 🎬 Processed Video")
-            st.info("💡 Gray boxes = unconfirmed vehicles (< 5 detections). Colored boxes = valid tracked vehicles.")
+            st.markdown("### 🎬 Processed Video with Detections")
             st.video(output_path)
             
             # Cleanup
             try:
                 os.unlink(video_path)
+                # Don't delete output_path yet, user might want to download
             except:
                 pass
 
